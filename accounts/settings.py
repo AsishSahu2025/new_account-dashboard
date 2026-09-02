@@ -147,7 +147,7 @@ DATABASES = {
         "NAME": "accountbanklist",
         "USER": "bariflo",
         "PASSWORD": "Bariflo@2401",
-        "HOST": "122.176.31.88",
+        "HOST": "192.168.1.199",
         "PORT": "5432",
         "OPTIONS": {
             "sslmode": "require",

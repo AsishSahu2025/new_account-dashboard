@@ -117,14 +117,28 @@ def _clean_description(text: str) -> str:
 
 
 def _deduplicate(txns: List[ParsedTransaction]) -> List[ParsedTransaction]:
+    """
+    De-dupe parsed rows.
+
+    IMPORTANT: the key is anchored on the running `balance`, not just a
+    truncated description. On real statements it's common to have two
+    genuinely different transactions on the same date, for the same
+    amount, to/from the same counterparty (e.g. two separate UPI debits
+    to the same person for different purposes) — their first ~30 chars
+    of description are identical, so keying on description[:30] alone
+    silently drops one of them. The running balance changes with every
+    transaction in a real ledger, so it's a much safer differentiator.
+    ref_no (when present) is the next-best differentiator; description
+    is only used as a last-resort fallback when neither is available.
+    """
     seen, out = set(), []
     for t in txns:
         key = (
             t.txn_date.isoformat(),
             str(t.amount),
             t.txn_type,
-            t.utr_no[:20],
-            t.description[:30],
+            str(t.balance) if t.balance is not None else '',
+            t.ref_no or t.description[:50],
         )
         if key not in seen:
             seen.add(key)
@@ -166,6 +180,34 @@ def _is_excel_file(file_name: str) -> bool:
 
 def _is_image_file(file_name: str) -> bool:
     return str(file_name or '').lower().endswith(('.png', '.jpg', '.jpeg'))
+
+
+def _validate_pdf_file(file_bytes: bytes) -> tuple:
+    """
+    Validate that the uploaded file is a readable PDF.
+
+    Returns:
+        (True, None) when valid.
+        (False, error_message) when invalid.
+    """
+
+    if not file_bytes:
+        return False, 'No file was provided.'
+
+    # Check PDF file signature
+    if not file_bytes.startswith(b'%PDF-'):
+        return False, 'The uploaded file is not a valid PDF.'
+
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            if not pdf.pages:
+                return False, 'The uploaded PDF contains no pages.'
+
+    except Exception:
+        logger.warning('Unable to open uploaded PDF', exc_info=True)
+        return False, 'The uploaded PDF is corrupted or cannot be opened.'
+
+    return True, None
 
 
 def _extract_excel_text(file_bytes: bytes) -> str:
@@ -304,18 +346,32 @@ def _extract_metadata(text: str) -> tuple:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DBS parser  (word-position based)
-# Columns (x0 boundaries in pts):
-#   Trans.Date 0–95 | Value Date 95–150 | Details 150–310
-#   Debits 310–430  | Credits 430–520   | Running Balance 520–620
+#
+# Column boundaries re-measured directly against a real DBS "Account
+# Details" export (595pt-wide A4 page). The previous boundaries were a
+# rough guess and didn't match this layout at all — e.g. the old
+# 'details' band (150, 310) missed the real Transaction Details column
+# (x0≈195), and the old 'debits'/'credits' bands (310-430 / 430-520)
+# didn't line up with where amounts are actually right-aligned
+# (Debit x0≈369-390, x1≈405 | Credit x0≈420-450, x1≈468).
+#
+# New boundaries (verified with pdfplumber word coordinates,
+# x_tolerance=3, against every row of a real statement):
+#   Date               x0 ≈ 37             → band (0, 100)
+#   Value Date         x0 ≈ 116-155        → band (100, 190)
+#   Transaction Details x0 ≈ 195, wraps to x1≈340 → band (190, 355)
+#   Debit              x0 ≈ 369-390, x1≈405        → band (355, 420)
+#   Credit             x0 ≈ 420-450, x1≈468         → band (420, 490)
+#   Running Balance    x0 ≈ 522-534, x1≈558         → band (490, 600)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DBS_COLS = {
-    'trans_date':  (0,   95),
-    'value_date':  (95,  150),
-    'details':     (150, 310),
-    'debits':      (310, 430),
-    'credits':     (430, 520),
-    'balance':     (520, 620),
+    'trans_date':  (0,   100),
+    'value_date':  (100, 190),
+    'details':     (190, 355),
+    'debits':      (355, 420),
+    'credits':     (420, 490),
+    'balance':     (490, 600),
 }
 _DBS_DATE_FMTS = ['%d-%b-%Y', '%d/%m/%Y', '%d-%m-%Y']
 
@@ -343,6 +399,18 @@ def _parse_dbs(pdf) -> tuple:
                     continue
 
                 first = rw[0]
+
+                # Sentinel: the transaction table ends at the "Total Debit
+                # Count / Total Credit Count / Total ... Amount" summary
+                # rows. Everything below that (disclaimers, "**END OF
+                # REPORT**", "Printed By ... Page 1 / 1") is footer text —
+                # without this check, footer fragments like the page
+                # number "1" in "Page 1 / 1" can land inside the credit
+                # column's x-range and get misread as a stray credit
+                # amount tacked onto the last real transaction.
+                if first['text'] == 'Total':
+                    break
+
                 txn_date = (_in_dbs(first, 'trans_date') and
                             _parse_date(first['text'], _DBS_DATE_FMTS))
 
@@ -448,7 +516,7 @@ _SBI_DATE_FMTS = ['%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y']
 # keywords → standard field name
 _SBI_HEADER_MAP = {
     'txn date': 'date',
-    'date': 'date',
+    # 'date': 'date',
     'value date': 'vdate',
     'description': 'desc',
     'ref no': 'ref',
@@ -560,115 +628,1162 @@ def _parse_sbi(pdf) -> tuple:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HDFC parser  (word-position based)
-# Columns (x0 in pts, 638pt wide page):
-#   Date 28–68 | Narration 68–290 | Chq/Ref 290–367 | Value Dt 362–410
-#   Withdrawal 405–492 | Deposit 490–565 | Closing Balance 562–640
+#
+# Column boundaries below were re-measured directly against a real HDFC
+# "BIZ PRO PLUS ACCOUNT" statement (612pt-wide page — NOT 638pt as the
+# old comment assumed). The previous boundaries were shifted right by
+# roughly 15-25pt across every column, which caused two silent failures:
+#
+#   1. Chq./Ref.No. column real x0 ≈ 268-337, but the old 'ref_no' band
+#      was (290, 367) — that overlapped the *Value Dt* column (real x0
+#      ≈ 346.7), so `ref_no` was actually getting filled with the value
+#      date string, while the real reference number fell inside the old
+#      'narration' band (68, 290) and got silently appended to the
+#      description instead.
+#   2. Withdrawal/Deposit/Balance bands were each shifted right by a
+#      similar margin, which is harmless only because amounts happen to
+#      be right-aligned within their real columns — but any statement
+#      with wider (more digits) amounts than this test file could have
+#      pushed a value's x0 left into the gap between the old 'value_date'
+#      and 'withdrawal' bands (362-405), where it would silently vanish
+#      (parsed as neither a date nor an amount).
+#
+# New boundaries (verified with pdfplumber word coordinates across all
+# transaction rows of a real statement, x_tolerance=2):
+#   Date         x0 ≈ 38.5           → band (0, 68)
+#   Narration    x0 ≈ 70-218         → band (68, 268)
+#   Chq./Ref.No. x0 ≈ 268-337        → band (268, 344)
+#   Value Dt     x0 ≈ 346.7 (fixed)  → band (344, 386)
+#   Withdrawal   x0 ≈ 386-448        → band (386, 462)
+#   Deposit      x0 ≈ 487-521        → band (462, 532)
+#   Closing Bal  x0 ≈ 560-594        → band (532, 612)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_HDFC_COLS = {
-    'date':       (28,  68),
-    'narration':  (68,  290),
-    'ref_no':     (290, 367),
-    'value_date': (362, 410),
-    'withdrawal': (405, 492),
-    'deposit':    (490, 565),
-    'balance':    (562, 640),
+
+
+_HDFC_HEADER_ALIASES = {
+    "date": [
+        ["date"],
+        ["txn", "date"],
+        ["transaction", "date"],
+    ],
+
+    "narration": [
+        ["narration"],
+        ["description"],
+        ["particulars"],
+    ],
+
+    "ref_no": [
+        ["chq", "ref", "no"],
+        ["chq", "ref"],
+        ["ref", "no"],
+        ["reference", "no"],
+        ["reference"],
+    ],
+
+    "value_date": [
+        ["value", "dt"],
+        ["value", "date"],
+    ],
+
+    "withdrawal": [
+        ["withdrawal"],
+        ["withdrawal", "amt"],
+        ["debit"],
+        ["debit", "amt"],
+    ],
+
+    "deposit": [
+        ["deposit"],
+        ["deposit", "amt"],
+        ["credit"],
+        ["credit", "amt"],
+    ],
+
+    "balance": [
+        ["closing", "balance"],
+        ["balance"],
+        ["closing", "bal"],
+    ],
 }
+
+# _HDFC_COLS = {
+#     'date':       (0,   68),
+#     'narration':  (68,  268),
+#     'ref_no':     (268, 344),
+#     'value_date': (344, 386),
+#     'withdrawal': (386, 462),
+#     'deposit':    (462, 532),
+#     'balance':    (532, 612),
+# }
 _HDFC_DATE_FMTS = ['%d/%m/%y', '%d/%m/%Y']
 
 
-def _in_hdfc(word: dict, col: str) -> bool:
-    x0, x1 = _HDFC_COLS[col]
+def _normalize_hdfc_header(text: str) -> str:
+    """
+    Generic normalization only.
+
+    Does not contain bank-format-specific mappings.
+    """
+
+    text = str(text or "").strip()
+
+    # Normalize CamelCase / concatenated PDF words.
+    # Examples:
+    #   ValueDt         -> Value Dt
+    #   WithdrawalAmt   -> Withdrawal Amt
+    #   ClosingBalance  -> Closing Balance
+    text = re.sub(
+        r"(?<=[a-z])(?=[A-Z])",
+        " ",
+        text,
+    )
+
+    # Normalize punctuation/separators.
+    text = re.sub(
+        r"[^a-zA-Z0-9]+",
+        " ",
+        text,
+    )
+
+    # Normalize repeated whitespace.
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text.lower()
+
+
+def _tokenize_hdfc_header(text: str) -> list[str]:
+    """
+    Convert a header string into semantic tokens.
+
+    Examples:
+
+        ValueDt
+            -> ["value", "dt"]
+
+        WithdrawalAmt.
+            -> ["withdrawal", "amt"]
+
+        ClosingBalance
+            -> ["closing", "balance"]
+
+        Chq./Ref.No.
+            -> ["chq", "ref", "no"]
+    """
+
+    normalized = _normalize_hdfc_header(text)
+
+    if not normalized:
+        return []
+
+    return normalized.split()
+
+
+def _match_hdfc_header_alias(
+    row: list[dict],
+    start_index: int,
+    alias: list[str],
+) -> Optional[dict]:
+    """
+    Match a semantic HDFC header alias against PDF words.
+
+    Matching is token-based rather than exact-string based.
+
+    Example:
+
+        PDF:
+            WithdrawalAmt.
+
+        Tokens:
+            ["withdrawal", "amt"]
+
+        Alias:
+            ["withdrawal", "amt"]
+
+        Result:
+            MATCH
+    """
+
+    if not alias:
+        return None
+
+    collected_words = []
+    collected_tokens = []
+
+    index = start_index
+
+    while index < len(row):
+
+        word = row[index]
+
+        tokens = _tokenize_hdfc_header(
+            word.get("text", "")
+        )
+
+        if not tokens:
+            index += 1
+            continue
+
+        collected_words.append(word)
+        collected_tokens.extend(tokens)
+
+        if collected_tokens == alias:
+
+            return {
+                "x0": min(
+                    w["x0"]
+                    for w in collected_words
+                ),
+                "x1": max(
+                    w["x1"]
+                    for w in collected_words
+                ),
+                "start_index": start_index,
+                "end_index": index,
+                "words": collected_words,
+            }
+
+        if len(collected_tokens) >= len(alias):
+            break
+
+        index += 1
+
+    return None
+
+
+def _debug_hdfc_header_rows(rows: dict, page_num: int) -> None:
+    """
+    Temporary diagnostic helper.
+
+    Prints the actual words and coordinates that pdfplumber
+    extracted from the HDFC page so we can see why header
+    detection is failing.
+    """
+
+    if page_num != 1:
+        return
+
+    logger.warning(
+        "========== HDFC HEADER DEBUG PAGE %d ==========",
+        page_num,
+    )
+
+    for row_number, top in enumerate(sorted(rows), 1):
+
+        row = sorted(
+            rows[top],
+            key=lambda w: w['x0'],
+        )
+
+        if not row:
+            continue
+
+        row_text = " | ".join(
+            str(w['text'])
+            for w in row
+        )
+
+        logger.warning(
+            "HDFC ROW %d | top=%s | %s",
+            row_number,
+            top,
+            row_text,
+        )
+
+        for word in row:
+            logger.warning(
+                "    text=%r x0=%.2f x1=%.2f top=%.2f bottom=%.2f",
+                word.get('text'),
+                word.get('x0', 0),
+                word.get('x1', 0),
+                word.get('top', 0),
+                word.get('bottom', 0),
+            )
+
+    logger.warning(
+        "========== END HDFC HEADER DEBUG =========="
+    )
+
+
+
+
+def _detect_hdfc_header(rows: dict) -> Optional[dict]:
+    """
+    Detect the logical HDFC transaction header.
+
+    Supports:
+        1. A single header row.
+        2. A two-row visual header.
+
+    The resulting header contains the actual PDF coordinates
+    of each semantic column.
+    """
+
+    row_items = []
+
+    for top in sorted(rows):
+
+        row = sorted(
+            rows[top],
+            key=lambda w: w['x0']
+        )
+
+        if not row:
+            continue
+
+        row_items.append({
+            'top': top,
+            'words': row,
+        })
+
+    candidates = []
+
+    # ---------------------------------------------------------
+    # Try a single-row header and a two-row header.
+    # ---------------------------------------------------------
+
+    for index in range(len(row_items)):
+
+        # -----------------------------------------------------
+        # Candidate 1: single visual row
+        # -----------------------------------------------------
+
+        windows = [
+            [row_items[index]]
+        ]
+
+        # -----------------------------------------------------
+        # Candidate 2: two nearby visual rows
+        #
+        # We only merge immediately adjacent rows. We do not
+        # scan arbitrary rows across the page.
+        # -----------------------------------------------------
+
+        if index + 1 < len(row_items):
+
+            current = row_items[index]
+            next_row = row_items[index + 1]
+
+            vertical_gap = (
+                next_row['top']
+                - current['top']
+            )
+
+            # Header lines should be close together.
+            #
+            # 15 points is intentionally conservative so that
+            # we don't accidentally merge unrelated statement
+            # sections.
+            if 0 < vertical_gap <= 15:
+
+                windows.append([
+                    current,
+                    next_row,
+                ])
+
+        for window in windows:
+
+            # -------------------------------------------------
+            # Flatten the words from the visual header rows.
+            #
+            # Keep physical coordinates from the PDF.
+            # -------------------------------------------------
+
+            logical_words = []
+
+            for row_info in window:
+
+                for word in row_info['words']:
+
+                    logical_words.append(word)
+
+            if not logical_words:
+                continue
+
+            # -------------------------------------------------
+            # For semantic matching, order by physical position.
+            #
+            # For words on different header lines, Y is also
+            # considered so that their original reading order
+            # remains stable.
+            # -------------------------------------------------
+
+            logical_words.sort(
+                key=lambda w: (
+                    round(w['top'], 2),
+                    w['x0'],
+                )
+            )
+
+            detected = {}
+
+            # -------------------------------------------------
+            # Search the complete logical header.
+            # -------------------------------------------------
+
+            for start_index in range(
+                len(logical_words)
+            ):
+
+                for field, aliases in (
+                    _HDFC_HEADER_ALIASES.items()
+                ):
+
+                    if field in detected:
+                        continue
+
+                    ordered_aliases = sorted(
+                        aliases,
+                        key=len,
+                        reverse=True,
+                    )
+
+                    for alias in ordered_aliases:
+
+                        match = _match_hdfc_header_alias(
+                            row=logical_words,
+                            start_index=start_index,
+                            alias=alias,
+                        )
+
+                        if match:
+
+                            detected[field] = {
+                                'text': alias,
+                                'x0': match['x0'],
+                                'x1': match['x1'],
+                                'start_index': (
+                                    match['start_index']
+                                ),
+                                'end_index': (
+                                    match['end_index']
+                                ),
+                                'words': match['words'],
+                            }
+
+                            break
+
+                    if field in detected:
+                        continue
+
+            # -------------------------------------------------
+            # Validate that this is actually a transaction
+            # header.
+            # -------------------------------------------------
+
+            core_fields = {
+                'date',
+                'narration',
+                'balance',
+            }
+
+            amount_fields = {
+                'withdrawal',
+                'deposit',
+            }
+
+            core_match = (
+                core_fields.intersection(
+                    detected.keys()
+                )
+            )
+
+            amount_match = (
+                amount_fields.intersection(
+                    detected.keys()
+                )
+            )
+
+            score = (
+                len(core_match) * 3
+                + len(amount_match) * 2
+                + (
+                    1
+                    if 'ref_no' in detected
+                    else 0
+                )
+                + (
+                    1
+                    if 'value_date' in detected
+                    else 0
+                )
+            )
+
+            if (
+                len(core_match) == len(core_fields)
+                and amount_match
+            ):
+                candidates.append({
+                    'row_top': window[0]['top'],
+                    'row_bottom': window[-1]['top'],
+                    'words': logical_words,
+                    'columns': detected,
+                    'score': score,
+                    'row_count': len(window),
+                })
+
+    if not candidates:
+        return None
+
+    # ---------------------------------------------------------
+    # Prefer:
+    #
+    # 1. Highest semantic score.
+    # 2. Single-row header when scores are equal.
+    #
+    # This prevents us from unnecessarily merging two rows.
+    # ---------------------------------------------------------
+
+    candidates.sort(
+        key=lambda item: (
+            item['score'],
+            -item['row_count'],
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]
+
+
+def _build_hdfc_columns(
+    header: dict,
+    rows: dict,
+) -> Optional[dict]:
+    """
+    Build dynamic HDFC transaction-column boundaries.
+
+    Header coordinates are used as semantic anchors.
+    They are NOT assumed to be the actual left boundary
+    of the transaction column.
+
+    Transaction-row X coordinates are used to determine
+    the actual content area dynamically.
+    """
+
+    detected = header.get('columns', {})
+
+    if not detected:
+        return None
+
+    # ---------------------------------------------------------
+    # Sort detected columns according to their header position.
+    # ---------------------------------------------------------
+
+    ordered = sorted(
+        detected.items(),
+        key=lambda item: item[1]['x0'],
+    )
+
+    if not ordered:
+        return None
+
+    # ---------------------------------------------------------
+    # Detect transaction-like rows.
+    #
+    # We use the detected DATE header as the anchor for finding
+    # rows that actually contain transactions.
+    # ---------------------------------------------------------
+
+    transaction_rows = []
+
+    date_info = detected.get('date')
+
+    if date_info:
+
+        date_x0 = date_info['x0']
+        date_x1 = date_info['x1']
+
+        for row in rows.values():
+
+            if not row:
+                continue
+
+            has_date = False
+
+            for word in row:
+
+                word_x0 = word.get('x0')
+
+                if word_x0 is None:
+                    continue
+
+                # Allow some tolerance because the transaction
+                # date does not necessarily have the same x0
+                # as the header text.
+                if not (
+                    date_x0 - 30
+                    <= word_x0
+                    <= date_x1 + 30
+                ):
+                    continue
+
+                if _parse_date(
+                    word.get('text', ''),
+                    _HDFC_DATE_FMTS,
+                ):
+                    has_date = True
+                    break
+
+            if has_date:
+                transaction_rows.append(row)
+
+    # ---------------------------------------------------------
+    # If no transaction rows were found, we cannot safely infer
+    # dynamic transaction boundaries.
+    #
+    # Do not create fixed/fallback coordinates.
+    # ---------------------------------------------------------
+
+    if not transaction_rows:
+        return None
+
+    # ---------------------------------------------------------
+    # For every detected semantic column, find the transaction
+    # words that are horizontally closest to the corresponding
+    # header anchor.
+    #
+    # This gives us the real transaction-side X position.
+    # ---------------------------------------------------------
+
+    transaction_anchors = {}
+
+    for field, info in ordered:
+
+        header_x0 = info['x0']
+        header_x1 = info['x1']
+
+        header_center = (
+            header_x0 + header_x1
+        ) / 2
+
+        candidates = []
+
+        for row in transaction_rows:
+
+            for word in row:
+
+                word_x0 = word.get('x0')
+                word_x1 = word.get('x1')
+
+                if (
+                    word_x0 is None
+                    or word_x1 is None
+                ):
+                    continue
+
+                word_center = (
+                    word_x0 + word_x1
+                ) / 2
+
+                distance = abs(
+                    word_center - header_center
+                )
+
+                candidates.append(
+                    (
+                        distance,
+                        word_x0,
+                        word_x1,
+                    )
+                )
+
+        if not candidates:
+            continue
+
+        # -----------------------------------------------------
+        # Use the transaction word closest to the header anchor.
+        # -----------------------------------------------------
+
+        candidates.sort(
+            key=lambda item: item[0]
+        )
+
+        _, anchor_x0, anchor_x1 = candidates[0]
+
+        transaction_anchors[field] = {
+            'x0': anchor_x0,
+            'x1': anchor_x1,
+        }
+
+    # ---------------------------------------------------------
+    # We need all detected columns to build a reliable ordered
+    # set of transaction anchors.
+    # ---------------------------------------------------------
+
+    if len(transaction_anchors) != len(ordered):
+        return None
+
+    # ---------------------------------------------------------
+    # Sort columns according to their transaction anchors.
+    # ---------------------------------------------------------
+
+    ordered_transaction = sorted(
+        transaction_anchors.items(),
+        key=lambda item: item[1]['x0'],
+    )
+
+    columns = {}
+
+    # ---------------------------------------------------------
+    # Build boundaries between neighboring transaction anchors.
+    #
+    # The boundary is halfway between the actual transaction
+    # positions, NOT halfway between header text positions.
+    # ---------------------------------------------------------
+
+    for index, (field, anchor) in enumerate(
+        ordered_transaction
+    ):
+
+        anchor_x0 = anchor['x0']
+        anchor_x1 = anchor['x1']
+
+        # -----------------------------------------------------
+        # First column.
+        #
+        # We deliberately extend to the left of the detected
+        # transaction word so that different transaction text
+        # widths do not get cut off.
+        # -----------------------------------------------------
+
+        if index == 0:
+
+            column_start = 0.0
+
+        else:
+
+            previous_field, previous_anchor = (
+                ordered_transaction[index - 1]
+            )
+
+            previous_x1 = previous_anchor['x1']
+
+            column_start = (
+                previous_x1 + anchor_x0
+            ) / 2
+
+        # -----------------------------------------------------
+        # Last column.
+        # -----------------------------------------------------
+
+        if index == len(
+            ordered_transaction
+        ) - 1:
+
+            max_x1 = max(
+                word['x1']
+                for row in transaction_rows
+                for word in row
+                if word.get('x1') is not None
+            )
+
+            column_end = max(
+                max_x1 + 20,
+                anchor_x1 + 20,
+            )
+
+        else:
+
+            _, next_anchor = (
+                ordered_transaction[index + 1]
+            )
+
+            next_x0 = next_anchor['x0']
+
+            column_end = (
+                anchor_x1 + next_x0
+            ) / 2
+
+        # -----------------------------------------------------
+        # Ensure the boundary is valid.
+        # -----------------------------------------------------
+
+        if column_start >= column_end:
+            return None
+
+        columns[field] = (
+            column_start,
+            column_end,
+        )
+
+    return columns
+
+
+def _validate_hdfc_columns(
+    header: dict,
+    columns: dict,
+) -> bool:
+
+    required_fields = {
+        'date',
+        'narration',
+        'balance',
+    }
+
+    amount_fields = {
+        'withdrawal',
+        'deposit',
+    }
+
+    if not required_fields.issubset(columns):
+        return False
+
+    if not amount_fields.intersection(columns):
+        return False
+
+    for field, bounds in columns.items():
+
+        if not isinstance(bounds, tuple):
+            return False
+
+        if len(bounds) != 2:
+            return False
+
+        x0, x1 = bounds
+
+        if x0 >= x1:
+            return False
+
+    ordered = sorted(
+        columns.items(),
+        key=lambda item: item[1][0],
+    )
+
+    for index in range(1, len(ordered)):
+
+        previous_x1 = ordered[index - 1][1][1]
+        current_x0 = ordered[index][1][0]
+
+        if current_x0 < previous_x1:
+            return False
+
+    positions = {
+        field: bounds[0]
+        for field, bounds in columns.items()
+    }
+
+    if positions['date'] >= positions['narration']:
+        return False
+
+    if 'ref_no' in positions:
+        if positions['ref_no'] <= positions['narration']:
+            return False
+
+    if 'value_date' in positions:
+
+        previous_field = (
+            'ref_no'
+            if 'ref_no' in positions
+            else 'narration'
+        )
+
+        if positions['value_date'] <= positions[previous_field]:
+            return False
+
+    amount_positions = [
+        positions[field]
+        for field in amount_fields
+        if field in positions
+    ]
+
+    if not amount_positions:
+        return False
+
+    if positions['balance'] <= max(amount_positions):
+        return False
+
+    # detected = header.get('columns', {})
+
+    # for field in columns:
+
+    #     if field not in detected:
+    #         return False
+
+    #     if abs(
+    #         detected[field]['x0']
+    #         - columns[field][0]
+    #     ) > 0.01:
+    #         return False
+
+    return True
+
+
+def _in_hdfc(
+    word: dict,
+    col: str,
+    columns: dict,
+) -> bool:
+
+    if col not in columns:
+        return False
+
+    x0, x1 = columns[col]
+
     return x0 <= word['x0'] < x1
+
+
 
 
 def _parse_hdfc(pdf) -> tuple:
     txns, errors = [], []
 
+    detected_columns = None
+
     for page_num, page in enumerate(pdf.pages, 1):
         try:
-            words = page.extract_words(x_tolerance=2, y_tolerance=3)
+            words = page.extract_words(
+                x_tolerance=2,
+                y_tolerance=3,
+            )
+
             rows: dict = defaultdict(list)
+
             for w in words:
                 rows[round(w['top'])].append(w)
+
+            # -------------------------------------------------
+            # TEMPORARY HDFC HEADER DEBUG
+            # -------------------------------------------------
+
+            _debug_hdfc_header_rows(
+                rows,
+                page_num,)
+            # -------------------------------------------------
+            # Detect HDFC header from this page.
+            # -------------------------------------------------
+
+            header = _detect_hdfc_header(rows)
+
+            if header:
+                logger.warning(
+                    "HDFC HEADER DETECTED | score=%s | row_count=%s | columns=%s",
+                    header.get("score"),
+                    header.get("row_count"),
+                    list(header.get("columns", {}).keys()),
+                )
+            else:
+                logger.warning(
+                    "HDFC HEADER NOT DETECTED"
+                )
+
+            if header:
+                page_columns = _build_hdfc_columns(header, rows)
+
+                if not page_columns:
+                    raise ValueError(
+                        'HDFC header detected but column '
+                        'coordinates could not be built'
+                    )
+
+                if not _validate_hdfc_columns(
+                    header,
+                    page_columns,
+                ):
+                    raise ValueError(
+                        'HDFC detected column structure '
+                        'failed validation'
+                    )
+
+                detected_columns = page_columns
+
+            # -------------------------------------------------
+            # No detected coordinates means we cannot safely
+            # parse this statement.
+            #
+            # There is intentionally NO fixed-coordinate
+            # fallback here.
+            # -------------------------------------------------
+
+            if detected_columns is None:
+                raise ValueError(
+                    'HDFC transaction header could not '
+                    'be reliably detected'
+                )
 
             pending = None
 
             for top in sorted(rows):
-                rw = sorted(rows[top], key=lambda w: w['x0'])
+
+                rw = sorted(
+                    rows[top],
+                    key=lambda w: w['x0']
+                )
+
                 if not rw:
                     continue
 
                 first = rw[0]
+
                 is_txn = (
-                    _in_hdfc(first, 'date') and
-                    bool(re.match(r'^\d{2}/\d{2}/\d{2,4}$', first['text']))
+                    _in_hdfc(
+                        first,
+                        'date',
+                        detected_columns,
+                    )
+                    and bool(
+                        re.match(
+                            r'^\d{2}/\d{2}/\d{2,4}$',
+                            first['text'],
+                        )
+                    )
                 )
 
                 if is_txn:
+
                     if pending:
                         t = _build_hdfc_txn(pending)
+
                         if t:
                             txns.append(t)
+
                     pending = {
-                        'date_str':   first['text'],
-                        'narration':  [],
-                        'ref':        '',
+                        'date_str': first['text'],
+                        'narration': [],
+                        'ref': '',
                         'value_date': None,
                         'withdrawal': None,
-                        'deposit':    None,
-                        'balance':    None,
+                        'deposit': None,
+                        'balance': None,
                     }
+
                     for w in rw[1:]:
+
                         txt = w['text']
-                        if _in_hdfc(w, 'narration'):
+
+                        if _in_hdfc(
+                            w,
+                            'narration',
+                            detected_columns,
+                        ):
                             pending['narration'].append(txt)
-                        elif _in_hdfc(w, 'ref_no'):
+
+                        elif _in_hdfc(
+                            w,
+                            'ref_no',
+                            detected_columns,
+                        ):
                             pending['ref'] = txt
-                        elif _in_hdfc(w, 'value_date'):
-                            pending['value_date'] = _parse_date(txt, _HDFC_DATE_FMTS)
-                        elif _in_hdfc(w, 'withdrawal'):
+
+                        elif _in_hdfc(
+                            w,
+                            'value_date',
+                            detected_columns,
+                        ):
+                            pending['value_date'] = _parse_date(
+                                txt,
+                                _HDFC_DATE_FMTS,
+                            )
+
+                        elif _in_hdfc(
+                            w,
+                            'withdrawal',
+                            detected_columns,
+                        ):
                             a = _parse_amount_positive(txt)
+
                             if a:
                                 pending['withdrawal'] = a
-                        elif _in_hdfc(w, 'deposit'):
+
+                        elif _in_hdfc(
+                            w,
+                            'deposit',
+                            detected_columns,
+                        ):
                             a = _parse_amount_positive(txt)
+
                             if a:
                                 pending['deposit'] = a
-                        elif _in_hdfc(w, 'balance'):
+
+                        elif _in_hdfc(
+                            w,
+                            'balance',
+                            detected_columns,
+                        ):
                             a = _parse_amount_positive(txt)
+
                             if a:
                                 pending['balance'] = a
+
                 else:
+
+                    # Continuation row.
                     if pending:
+
                         for w in rw:
+
                             txt = w['text']
-                            if _in_hdfc(w, 'narration'):
+
+                            if _in_hdfc(
+                                w,
+                                'narration',
+                                detected_columns,
+                            ):
                                 pending['narration'].append(txt)
-                            elif _in_hdfc(w, 'withdrawal') and pending['withdrawal'] is None:
+
+                            elif (
+                                _in_hdfc(
+                                    w,
+                                    'withdrawal',
+                                    detected_columns,
+                                )
+                                and pending['withdrawal'] is None
+                            ):
                                 a = _parse_amount_positive(txt)
+
                                 if a:
                                     pending['withdrawal'] = a
-                            elif _in_hdfc(w, 'deposit') and pending['deposit'] is None:
+
+                            elif (
+                                _in_hdfc(
+                                    w,
+                                    'deposit',
+                                    detected_columns,
+                                )
+                                and pending['deposit'] is None
+                            ):
                                 a = _parse_amount_positive(txt)
+
                                 if a:
                                     pending['deposit'] = a
-                            elif _in_hdfc(w, 'balance') and pending['balance'] is None:
+
+                            elif (
+                                _in_hdfc(
+                                    w,
+                                    'balance',
+                                    detected_columns,
+                                )
+                                and pending['balance'] is None
+                            ):
                                 a = _parse_amount_positive(txt)
+
                                 if a:
                                     pending['balance'] = a
 
             if pending:
+
                 t = _build_hdfc_txn(pending)
+
                 if t:
                     txns.append(t)
 
         except Exception as e:
-            errors.append(f'HDFC page {page_num}: {e}')
-            logger.warning('HDFC page %d error: %s', page_num, e)
+
+            errors.append(
+                f'HDFC page {page_num}: {e}'
+            )
+
+            logger.warning(
+                'HDFC page %d error: %s',
+                page_num,
+                e,
+            )
 
     return txns, errors
-
 
 def _build_hdfc_txn(p: dict) -> Optional[ParsedTransaction]:
     txn_date = _parse_date(p['date_str'], _HDFC_DATE_FMTS)

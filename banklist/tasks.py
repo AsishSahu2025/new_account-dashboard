@@ -3,6 +3,7 @@
 from celery import shared_task
 from .services.google_drive_service import drive_service
 import logging
+from banklist.services.reconciliation_v2_engine import auto_receipt_matching,auto_bank_reconciliation
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,11 @@ def parse_statement_task(self, statement_id: int):
             )
             created += 1
 
+        auto_bank_reconciliation(
+            company=stmt.bank_account.company,
+            uploaded_bank_account_id=stmt.bank_account.id,
+        )
+
         logger.info(
             f"Statement {statement_id} ({result.bank_name}): "
             f"{created} created, {skipped} skipped duplicates"
@@ -151,49 +157,278 @@ def process_receipt_task(self, receipt_id: int):
     """Download a receipt from Drive, extract amount/date, save to DB."""
     from banklist.models import ReceiptDocument
     from banklist.services.receipt_parser import parse_receipt_pdf
+    from django.db.models import Sum
+    from decimal import Decimal
 
+    # try:
+    #     receipt = ReceiptDocument.objects.get(id=receipt_id)
+    #     logger.info(f"Processing receipt {receipt_id}: {receipt.file_name}")
+
+    #     file_bytes = drive_service.download_file(receipt.drive_file_id)
+    #     if not file_bytes:
+    #         raise Exception(f"Could not download file from Drive: {receipt.drive_file_id}")
+
+    #     result = parse_receipt_pdf(file_bytes, receipt.file_name)
+
+    #     receipt.receipt_no   = result.get('receipt_no')   or receipt.receipt_no
+    #     receipt.receipt_date = result.get('receipt_date') or receipt.receipt_date
+
+    #     if result.get('amount'):
+    #         receipt.amount           = result['amount']
+    #         receipt.extracted        = True
+    #         receipt.extraction_error = ''
+    #         logger.info(f"Receipt {receipt_id}: ₹{receipt.amount}")
+    #     else:
+    #         receipt.extracted        = False
+    #         receipt.extraction_error = result.get('error', 'Could not extract amount')
+    #         logger.warning(f"Receipt {receipt_id}: {receipt.extraction_error}")
+
+    #     receipt.save()
+    #     receipt.refresh_from_db()
+    #     print(receipt.receipt_date)
+    #     print(type(receipt.receipt_date))
+
+    #     auto_receipt_matching(
+    #         company=receipt.company,
+    #         receipt=receipt,
+    #     )
+
+    #     return {
+    #         'success':      True,
+    #         'receipt_id':   receipt_id,
+    #         'file_name':    receipt.file_name,
+    #         'amount':       str(receipt.amount) if receipt.amount else None,
+    #         'receipt_no':   receipt.receipt_no,
+    #         'receipt_date': str(receipt.receipt_date) if receipt.receipt_date else None,
+    #     }
+
+    # except ReceiptDocument.DoesNotExist:
+    #     logger.error(f"Receipt {receipt_id} not found")
+    #     return {'success': False, 'error': 'Receipt not found'}
+
+    # except Exception as exc:
+    #     logger.error(f"Task error for receipt {receipt_id}: {exc}", exc_info=True)
+    #     # FIX: don't pass max_retries inside retry() — it's set at task level
+    #     self.retry(exc=exc, countdown=30)
     try:
         receipt = ReceiptDocument.objects.get(id=receipt_id)
-        logger.info(f"Processing receipt {receipt_id}: {receipt.file_name}")
 
-        file_bytes = drive_service.download_file(receipt.drive_file_id)
+        logger.info(
+            f"Processing receipt {receipt_id}: {receipt.file_name}"
+        )
+
+        # -------------------------------------------------
+        # 1. Download receipt from Drive
+        # -------------------------------------------------
+        file_bytes = drive_service.download_file(
+            receipt.drive_file_id
+        )
+
         if not file_bytes:
-            raise Exception(f"Could not download file from Drive: {receipt.drive_file_id}")
+            raise Exception(
+                f"Could not download file from Drive: "
+                f"{receipt.drive_file_id}"
+            )
 
-        result = parse_receipt_pdf(file_bytes, receipt.file_name)
+        # -------------------------------------------------
+        # 2. Extract receipt information
+        # -------------------------------------------------
+        result = parse_receipt_pdf(
+            file_bytes,
+            receipt.file_name
+        )
 
-        receipt.receipt_no   = result.get('receipt_no')   or receipt.receipt_no
-        receipt.receipt_date = result.get('receipt_date') or receipt.receipt_date
+        receipt.receipt_no = (
+            result.get('receipt_no')
+            or receipt.receipt_no
+        )
 
-        if result.get('amount'):
-            receipt.amount           = result['amount']
-            receipt.extracted        = True
+        receipt.receipt_date = (
+            result.get('receipt_date')
+            or receipt.receipt_date
+        )
+
+        # -------------------------------------------------
+        # 3. Amount extraction failed
+        # -------------------------------------------------
+        if not result.get('amount'):
+
+            receipt.extracted = False
+            receipt.extraction_error = result.get(
+                'error',
+                'Could not extract amount'
+            )
+            receipt.save()
+
+            logger.warning(
+                f"Receipt {receipt_id}: "
+                f"{receipt.extraction_error}"
+            )
+
+            return {
+                'success': False,
+                'receipt_id': receipt_id,
+                'error': receipt.extraction_error
+            }
+
+        extracted_amount = Decimal(str(result['amount']))
+
+        # -------------------------------------------------
+        # 4. Transaction-specific receipt validation
+        # -------------------------------------------------
+        if receipt.matched_transaction_id:
+
+            transaction = receipt.matched_transaction
+
+            # Only debit transactions are allowed
+            if transaction.txn_type != 'debit':
+
+                receipt.amount = extracted_amount
+                receipt.extracted = False
+                receipt.extraction_error = (
+                    'Receipts can only be linked to debit transactions.'
+                )
+                receipt.save()
+
+                return {
+                    'success': False,
+                    'receipt_id': receipt_id,
+                    'error': receipt.extraction_error
+                }
+
+            # -------------------------------------------------
+            # Get already VALID receipts for this transaction
+            # -------------------------------------------------
+            existing_total = (
+                ReceiptDocument.objects
+                .filter(
+                    matched_transaction=transaction,
+                    extracted=True
+                )
+                .exclude(id=receipt.id)
+                .aggregate(
+                    total=Sum('amount')
+                )['total']
+                or Decimal('0.00')
+            )
+
+            remaining_amount = (
+                transaction.amount - existing_total
+            )
+
+            # -------------------------------------------------
+            # New receipt cannot exceed remaining amount
+            # -------------------------------------------------
+            if extracted_amount > remaining_amount:
+
+                receipt.amount = extracted_amount
+                receipt.extracted = False
+                receipt.extraction_error = (
+                    f'Receipt amount exceeds the remaining '
+                    f'transaction amount. '
+                    f'Transaction amount: '
+                    f'₹{transaction.amount}, '
+                    f'Already allocated: '
+                    f'₹{existing_total}, '
+                    f'Remaining amount: '
+                    f'₹{remaining_amount}, '
+                    f'Receipt amount: '
+                    f'₹{extracted_amount}.'
+                )
+                receipt.save()
+
+                logger.warning(
+                    f"Receipt {receipt_id} rejected. "
+                    f"Transaction {transaction.id}: "
+                    f"remaining ₹{remaining_amount}, "
+                    f"receipt ₹{extracted_amount}"
+                )
+
+                return {
+                    'success': False,
+                    'receipt_id': receipt_id,
+                    'transaction_id': transaction.id,
+                    'error': receipt.extraction_error
+                }
+
+            # -------------------------------------------------
+            # Receipt is valid
+            # -------------------------------------------------
+            receipt.amount = extracted_amount
+            receipt.extracted = True
             receipt.extraction_error = ''
-            logger.info(f"Receipt {receipt_id}: ₹{receipt.amount}")
-        else:
-            receipt.extracted        = False
-            receipt.extraction_error = result.get('error', 'Could not extract amount')
-            logger.warning(f"Receipt {receipt_id}: {receipt.extraction_error}")
+            receipt.save()
 
-        receipt.save()
+            logger.info(
+                f"Transaction receipt {receipt_id} validated. "
+                f"Amount: ₹{extracted_amount}"
+            )
+
+        else:
+
+            # -------------------------------------------------
+            # Existing global receipt flow
+            # -------------------------------------------------
+            receipt.amount = extracted_amount
+            receipt.extracted = True
+            receipt.extraction_error = ''
+            receipt.save()
+
+            # Existing automatic matching remains unchanged
+            auto_receipt_matching(
+                company=receipt.company,
+                receipt=receipt,
+            )
+
+        # -------------------------------------------------
+        # 5. Refresh and return
+        # -------------------------------------------------
+        receipt.refresh_from_db()
 
         return {
-            'success':      True,
-            'receipt_id':   receipt_id,
-            'file_name':    receipt.file_name,
-            'amount':       str(receipt.amount) if receipt.amount else None,
-            'receipt_no':   receipt.receipt_no,
-            'receipt_date': str(receipt.receipt_date) if receipt.receipt_date else None,
+            'success': True,
+            'receipt_id': receipt_id,
+            'file_name': receipt.file_name,
+            'amount': (
+                str(receipt.amount)
+                if receipt.amount
+                else None
+            ),
+            'receipt_no': receipt.receipt_no,
+            'receipt_date': (
+                str(receipt.receipt_date)
+                if receipt.receipt_date
+                else None
+            ),
+            'transaction_id': (
+                receipt.matched_transaction_id
+                if receipt.matched_transaction_id
+                else None
+            )
         }
 
     except ReceiptDocument.DoesNotExist:
-        logger.error(f"Receipt {receipt_id} not found")
-        return {'success': False, 'error': 'Receipt not found'}
+
+        logger.error(
+            f"Receipt {receipt_id} not found"
+        )
+
+        return {
+            'success': False,
+            'error': 'Receipt not found'
+        }
 
     except Exception as exc:
-        logger.error(f"Task error for receipt {receipt_id}: {exc}", exc_info=True)
-        # FIX: don't pass max_retries inside retry() — it's set at task level
-        self.retry(exc=exc, countdown=30)
+
+        logger.error(
+            f"Task error for receipt {receipt_id}: {exc}",
+            exc_info=True
+        )
+
+        self.retry(
+            exc=exc,
+            countdown=30
+        )
 
 
 @shared_task(bind=True, max_retries=3)

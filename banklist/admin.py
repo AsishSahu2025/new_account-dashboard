@@ -1,18 +1,9 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 
-from .models import (
-    Bank,
-    Company,
-    User,
-    BankAccount,
-    UploadedStatement,
-    Transaction,
-    ReceiptDocument,
-    ReconciliationRun,
-    ReconciliationRule,
-    AuditLog,
-)
+from .models import (Bank,Company,User,BankAccount,UploadedStatement,Transaction,ReceiptDocument,ReconciliationRun,ReconciliationRule,
+                        AuditLog,Particular,AccountingParticular,Grant,GrantMaster,Fund,TransactionFundAllocation,InternalTransfer,InternalTransferTransaction,
+                        BankStatementConfig, BankStatementFieldAlias, Agency, GrantMilestone, GrantTransaction, TransactionGrantAllocation)
 
 
 @admin.register(Bank)
@@ -32,25 +23,11 @@ class CompanyAdmin(admin.ModelAdmin):
 class CustomUserAdmin(UserAdmin):
     model = User
 
-    list_display = (
-        "email",
-        "full_name",
-        "company",
-        "is_staff",
-        "is_active",
-        "created_at",
-    )
+    list_display = ("email","full_name","company","is_staff","is_active","created_at",)
 
-    list_filter = (
-        "is_staff",
-        "is_active",
-        "company",
-    )
+    list_filter = ("is_staff","is_active","company",)
 
-    search_fields = (
-        "email",
-        "full_name",
-    )
+    search_fields = ("email","full_name",)
 
     ordering = ("email",)
 
@@ -58,13 +35,7 @@ class CustomUserAdmin(UserAdmin):
         (None, {"fields": ("email", "password")}),
         ("Personal Info", {"fields": ("full_name", "company")}),
         ("Permissions", {
-            "fields": (
-                "is_active",
-                "is_staff",
-                "is_superuser",
-                "groups",
-                "user_permissions",
-            )
+            "fields": ("is_active","is_staff","is_superuser","groups","user_permissions",)
         }),
         ("Important Dates", {"fields": ("last_login", "created_at")}),
     )
@@ -76,8 +47,7 @@ class CustomUserAdmin(UserAdmin):
             None,
             {
                 "classes": ("wide",),
-                "fields": (
-                    "email",
+                "fields": ("email",
                     "full_name",
                     "company",
                     "password1",
@@ -126,12 +96,15 @@ class UploadedStatementAdmin(admin.ModelAdmin):
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):
     list_display = (
+        "id",
         "txn_date",
         "bank_account",
         "txn_type",
         "amount",
         "balance",
+        "particular",
         "reconcile_status",
+        "accounting_particular_id"
     )
 
     search_fields = (
@@ -154,6 +127,7 @@ class ReceiptDocumentAdmin(admin.ModelAdmin):
         "company",
         "receipt_no",
         "amount",
+        "extraction_error",
         "extracted",
         "uploaded_at",
     )
@@ -220,3 +194,74 @@ class AuditLogAdmin(admin.ModelAdmin):
         "action",
         "company",
     )
+
+
+@admin.register(Particular)
+class ParticularAdmin(admin.ModelAdmin):
+    list_display = ["id","name","is_active","transaction_type","created_at"]
+
+
+@admin.register(AccountingParticular)
+class AccountParticularAdmin(admin.ModelAdmin):
+    list_display = ["id","name","is_active","created_at"]
+
+
+
+@admin.register(Agency)
+class GrantMasterAdmin(admin.ModelAdmin):
+    list_display = ["id","name","short_name","is_active","created_at","updated_at"]
+
+
+@admin.register(Grant)
+class GrantAdmin(admin.ModelAdmin):
+    list_display = ["id","company","agency","name","description","is_active","created_at","updated_at"]
+
+
+
+@admin.register(Fund)
+class FundAdmin(admin.ModelAdmin):
+    list_display = ["id","grant","source_transaction","name","amount","created_at","updated_at"]
+
+
+
+@admin.register(TransactionFundAllocation)
+class TransactionFundAllocationAdmin(admin.ModelAdmin):
+    list_display = ["id","transaction","fund","amount","allocation_type","created_by","created_at","updated_at"]
+
+
+@admin.register(TransactionGrantAllocation)
+class TransactionFundAllocationAdmin(admin.ModelAdmin):
+    list_display = ["id","transaction","grant","amount","allocation_type","created_by","created_at","updated_at"]
+
+
+
+@admin.register(InternalTransfer)
+class InternalTransferAdmin(admin.ModelAdmin):
+    list_display = ["id","company","transfer_date","amount","created_by","created_at","updated_at"]
+
+
+
+@admin.register(InternalTransferTransaction)
+class InternalTransferTransactionAdmin(admin.ModelAdmin):
+    list_display = ["id","internal_transfer","transaction","role"]
+
+
+
+@admin.register(BankStatementConfig)
+class BankStatementConfigAdmin(admin.ModelAdmin):
+    list_display = ["id","bank","extraction_strategy","is_active"]
+
+
+
+@admin.register(BankStatementFieldAlias)
+class BankStatementFieldAliasAdmin(admin.ModelAdmin):
+    list_display = ["id","config","field_name","alias","is_active"]
+
+
+@admin.register(GrantTransaction)
+class GrantTransactionAdmin(admin.ModelAdmin):
+    list_display = ["id","grant","transaction_name","transaction_date"]
+
+@admin.register(GrantMilestone)
+class GrantMilestone(admin.ModelAdmin):
+    list_display = ["id","grant","name","budget"]
